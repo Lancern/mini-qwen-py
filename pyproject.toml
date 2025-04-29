@@ -10,6 +10,7 @@ license-files = ["LICENSE"]
 dependencies = [
     "safetensors",
     "torch",
+    "transformers",
 ]
 
 [build-system]
