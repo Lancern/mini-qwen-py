@@ -1,0 +1,17 @@
+[project]
+name = "mini-qwen"
+description = "A toy implementation of Qwen3 inference"
+version = "0.1.0"
+authors = [
+    {name = "Sirui Mu", email = "msrlancern@gmail.com"}
+]
+license-files = ["LICENSE"]
+
+dependencies = [
+    "safetensors",
+    "torch",
+]
+
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
