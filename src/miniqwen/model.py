@@ -2,6 +2,7 @@ import os
 import json
 from typing import TYPE_CHECKING
 
+import torch
 import torch.nn as nn
 from safetensors import safe_open
 from transformers import Qwen2Tokenizer
@@ -25,6 +26,23 @@ class Embedding(nn.Module):
         return self._embed(x)
 
 
+class RoPE(nn.Module):
+    def __init__(self, theta: int | float, head_dim: int):
+        assert head_dim % 2 == 0
+        super().__init__()
+
+        self._theta = theta
+
+        # inv_freq :: (head_dim / 2)
+        # inv_freq[i] = theta ** (-2i / head_dim)
+        self._inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2) / head_dim))
+
+    def forward(self, x):
+        # x :: (batch_size, seq_len, head_dim)
+        # ret :: (batch_size, seq_len, head_dim)
+        pass
+
+
 class Model(nn.Module):
     def __init__(self, model_dir: "PathLike"):
         with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
@@ -39,6 +57,7 @@ class Model(nn.Module):
         self._embedding = Embedding(
             self._config["vocab_size"], self._config["hidden_size"], self._model_tensors
         )
+        self._rope = RoPE(self._config["rope_theta"], self._config["head_dim"])
 
     def generate(self, prompt: str) -> str:
         input = self._tokenizer(self._apply_chat_template(prompt), return_tensors="pt")[
