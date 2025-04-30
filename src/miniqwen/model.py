@@ -1,4 +1,3 @@
-import os
 from typing import TYPE_CHECKING
 
 from transformers import Qwen2Tokenizer
@@ -9,10 +8,11 @@ if TYPE_CHECKING:
 
 class Model:
     def __init__(self, model_dir: "PathLike"):
-        self._tokenizer = Qwen2Tokenizer(
-            vocab_file=os.path.join(model_dir, "vocab.json"),
-            merges_file=os.path.join(model_dir, "merges.txt"),
-        )
+        self._tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
 
     def generate(self, prompt: str) -> str:
+        input = self._tokenizer(self._apply_chat_template(prompt))["input_ids"]
         pass
+
+    def _apply_chat_template(self, prompt: str) -> str:
+        return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
