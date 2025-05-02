@@ -11,6 +11,7 @@ from transformers import Qwen2Tokenizer
 from .transformer import DecoderLayer, LayerNorm
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from os import PathLike
 
 
@@ -101,6 +102,8 @@ class Model(nn.Module):
         self._top_k: float = self._generation_config["top_k"]
         self._top_p: float = self._generation_config["top_p"]
 
+        self._eos: int = self._config["eos_token_id"]
+
         self._tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
         self._model_tensors = safe_open(
             os.path.join(model_dir, "model.safetensors"), framework="pt"
@@ -135,18 +138,23 @@ class Model(nn.Module):
             {"weight": self._model_tensors.get_tensor("lm_head.weight")}
         )
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, max_generate_len: int = 1000) -> "Generator[str]":
         input_ids = self._tokenizer(
             self._apply_chat_template(prompt), return_tensors="pt"
         )["input_ids"]
         # input_ids :: (1, seq_len)
 
-        print("Input token ids:", input_ids)
+        for _ in range(max_generate_len):
+            output_id = int(self.generate_once(input_ids).squeeze())
+            if output_id == self._eos:
+                break
 
-        output_id = self.generate_once(input_ids).squeeze()
-        output_token = self._tokenizer.decode(output_id, skip_special_tokens=True)
-        print("Output token id:", output_id)
-        print(f'Output token: "{output_token}"')
+            output_token = self._tokenizer.decode(output_id, skip_special_tokens=True)
+            yield output_token
+
+            input_ids = torch.cat(
+                (input_ids.squeeze(0), torch.tensor([output_id]))
+            ).unsqueeze(0)
 
     def generate_once(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids :: (batch_size, seq_len)
