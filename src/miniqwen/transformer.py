@@ -17,6 +17,9 @@ class SelfAttention(nn.Module):
         super().__init__()
 
         self._head_dim = head_dim
+        self._num_attention_heads = num_attention_heads
+        self._num_kv_heads = num_kv_heads
+        self._num_kv_groups = self._num_attention_heads // self._num_kv_heads
 
         self._q_proj = nn.Linear(
             hidden_size, num_attention_heads * head_dim, bias=False
@@ -73,7 +76,6 @@ class SelfAttention(nn.Module):
         self, x: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor]
     ):
         # x :: (batch_size, seq_len, hidden_size)
-        # position_embeddings[0] ::
 
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, -1, self._head_dim)
@@ -104,6 +106,7 @@ class SelfAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # q :: (batch_size, num_attention_heads, seq_len, head_dim)
         # k :: (batch_size, num_kv_heads, seq_len, head_dim)
+        # cos, sin :: (batch_size, seq_len, head_dim)
 
         def rotate_half(x):
             # x :: (..., d)
@@ -114,6 +117,7 @@ class SelfAttention(nn.Module):
 
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
+        # cos, sin :: (batch_size, 1, seq_len, head_dim)
         q_embed = (q * cos) + (rotate_half(q) * sin)
         k_embed = (k * cos) + (rotate_half(k) * sin)
         return q_embed, k_embed
@@ -126,38 +130,38 @@ class SelfAttention(nn.Module):
         # v :: (batch_size, num_kv_heads, seq_len, head_dim)
 
         # Make the shape of k and v the same as q.
-        batch_size, num_kv_heads, seq_len, head_dim = k.shape
-        num_attention_heads = q.shape[1]
-        num_kv_groups = num_attention_heads // num_kv_heads
-
-        def expand_kv(x: torch.Tensor) -> torch.Tensor:
-            if num_kv_groups <= 1:
-                return x
-            x = x[:, :, None, :, :].expand(
-                batch_size, num_kv_heads, num_kv_groups, seq_len, head_dim
-            )
-            return x.reshape(batch_size, num_attention_heads, seq_len, head_dim)
-
-        k = expand_kv(k)
-        v = expand_kv(v)
+        k = self._expand_kv(k)
+        v = self._expand_kv(v)
         # k :: (batch_size, num_attention_heads, seq_len, head_dim)
         # v :: (batch_size, num_attention_heads, seq_len, head_dim)
 
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
         scaling = self._head_dim**-0.5
-        attn_weights = torch.matmul(q, k.transpose(2, 3)) * scaling
-        # attn_weights :: (batch_size, num_attention_heads, seq_len, seq_len)
-
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(q.dtype)
-        # attn_weights :: (batch_size, num_attention_heads, seq_len, seq_len)
-
-        attn_output = torch.matmul(attn_weights, v)
+        is_causal = q.shape[2] > 1
+        attn_output = nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, is_causal=is_causal, scale=scaling
+        )
         # attn_output :: (batch_size, num_attention_heads, seq_len, head_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        # attn_output :: (batch_size, seq_len, num_attention_heads, head_dim)
 
-        return attn_output
+        # ret :: (batch_size, seq_len, num_attention_heads, head_dim)
+        return attn_output.transpose(1, 2).contiguous()
+
+    def _expand_kv(self, x: torch.Tensor) -> torch.Tensor:
+        # x :: (batch_size, num_kv_heads, seq_len, head_dim)
+        # ret :: (batch_size, num_kv_heads * num_kv_groups, seq_len, head_dim)
+
+        batch_size, num_kv_heads, seq_len, head_dim = x.shape
+
+        if self._num_kv_groups <= 1:
+            return x
+
+        x = x[:, :, None, :, :].expand(
+            batch_size, num_kv_heads, self._num_kv_groups, seq_len, head_dim
+        )
+        return x.reshape(batch_size, -1, seq_len, head_dim)
 
 
 class MLP(nn.Module):
@@ -243,6 +247,7 @@ class DecoderLayer(nn.Module):
     ):
         super().__init__()
 
+        self._layer_idx = layer_idx
         self._hidden_size = hidden_size
 
         self._self_attn = SelfAttention(

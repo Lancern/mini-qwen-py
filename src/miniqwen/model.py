@@ -1,3 +1,4 @@
+import math
 import os
 import json
 from typing import TYPE_CHECKING
@@ -80,9 +81,14 @@ class Model(nn.Module):
 
         with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
             self._config = json.load(f)
+        with open(
+            os.path.join(model_dir, "generation_config.json"), "r", encoding="utf-8"
+        ) as f:
+            self._generation_config = json.load(f)
 
         self._vocab_size: int = self._config["vocab_size"]
         self._rope_theta: float = self._config["rope_theta"]
+
         self._hidden_size: int = self._config["hidden_size"]
         self._head_dim: int = self._config["head_dim"]
         self._num_attention_heads: int = self._config["num_attention_heads"]
@@ -90,6 +96,10 @@ class Model(nn.Module):
         self._intermediate_size: int = self._config["intermediate_size"]
         self._rms_norm_eps: float = self._config["rms_norm_eps"]
         self._num_hidden_layers: int = self._config["num_hidden_layers"]
+
+        self._temperature: float = self._generation_config["temperature"]
+        self._top_k: float = self._generation_config["top_k"]
+        self._top_p: float = self._generation_config["top_p"]
 
         self._tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
         self._model_tensors = safe_open(
@@ -131,12 +141,27 @@ class Model(nn.Module):
         )["input_ids"]
         # input_ids :: (1, seq_len)
 
-        logits = self(input_ids)
-        # logits :: (1, seq_len, vocab_size)
-        print("input_ids shape:", input_ids.shape)
-        print("logits shape:", logits.shape)
+        print("Input token ids:", input_ids)
 
-        pass
+        output_id = self.generate_once(input_ids).squeeze()
+        output_token = self._tokenizer.decode(output_id, skip_special_tokens=True)
+        print("Output token id:", output_id)
+        print(f'Output token: "{output_token}"')
+
+    def generate_once(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # input_ids :: (batch_size, seq_len)
+        # ret :: (batch_size, 1)
+
+        logits = self(input_ids)
+        # logits :: (batch_size, seq_len, vocab_size)
+
+        logits = logits[:, -1, :].squeeze(dim=1) / self._temperature
+        # logits :: (batch_size, vocab_size)
+
+        probs = self._apply_top_p(self._apply_top_k(logits)).softmax(dim=-1)
+        # probs :: (batch_size, vocab_size)
+
+        return torch.multinomial(probs, num_samples=1)
 
     def forward(self, input_ids: torch.Tensor):
         # input_ids :: (batch_size, seq_len)
@@ -170,3 +195,31 @@ class Model(nn.Module):
 
     def _apply_chat_template(self, prompt: str) -> str:
         return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+    def _apply_top_k(self, logits: torch.Tensor) -> torch.Tensor:
+        # logits :: (batch_size, vocab_size)
+
+        min_top_k_prob = torch.topk(logits, self._top_k)[0][..., -1, None]
+        # min_top_k_prob :: (batch_size, 1)
+        mask = logits < min_top_k_prob
+        # mask :: (batch_size, vocab_size)
+
+        return logits.masked_fill(mask, -math.inf)
+
+    def _apply_top_p(self, logits: torch.Tensor) -> torch.Tensor:
+        # logits :: (batch_size, vocab_size)
+
+        sorted_logits, sorted_indecies = torch.sort(logits, descending=False)
+        # sorted_logits :: (batch_size, vocab_size)
+        # sorted_indecies :: (batch_size, vocab_size)
+
+        cum_prob = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        # cum_prob :: (batch_size, vocab_size)
+
+        reset_mask_sorted = cum_prob <= (1 - self._top_p)
+        # Make sure the logit giving the highest probability is always kept
+        reset_mask_sorted[..., -1:] = 0
+        # reset_mask :: (batch_size, vocab_size)
+
+        reset_mask = reset_mask_sorted.scatter(1, sorted_indecies, reset_mask_sorted)
+        return logits.masked_fill(reset_mask, -math.inf)
