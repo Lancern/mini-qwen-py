@@ -1,6 +1,11 @@
+from typing import Optional, TYPE_CHECKING
+
 from safetensors import safe_open
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from .cache import Cache, LayerCache
 
 
 class SelfAttention(nn.Module):
@@ -13,6 +18,7 @@ class SelfAttention(nn.Module):
         num_kv_heads: int,
         layernorm_eps: float,
         model_tensors: safe_open,
+        cache: Optional["LayerCache"] = None,
     ):
         super().__init__()
 
@@ -20,6 +26,8 @@ class SelfAttention(nn.Module):
         self._num_attention_heads = num_attention_heads
         self._num_kv_heads = num_kv_heads
         self._num_kv_groups = self._num_attention_heads // self._num_kv_heads
+
+        self._cache = cache
 
         self._q_proj = nn.Linear(
             hidden_size, num_attention_heads * head_dim, bias=False
@@ -126,14 +134,16 @@ class SelfAttention(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
         # q :: (batch_size, num_attention_heads, seq_len, head_dim)
-        # k :: (batch_size, num_kv_heads, seq_len, head_dim)
-        # v :: (batch_size, num_kv_heads, seq_len, head_dim)
+        # k :: (batch_size, num_kv_heads, kv_seq_len, head_dim)
+        # v :: (batch_size, num_kv_heads, kv_seq_len, head_dim)
 
-        # Make the shape of k and v the same as q.
         k = self._expand_kv(k)
         v = self._expand_kv(v)
-        # k :: (batch_size, num_attention_heads, seq_len, head_dim)
-        # v :: (batch_size, num_attention_heads, seq_len, head_dim)
+        # k :: (batch_size, num_attention_heads, kv_seq_len, head_dim)
+        # v :: (batch_size, num_attention_heads, kv_seq_len, head_dim)
+
+        if self._cache is not None:
+            k, v = self._cache.update_and_concat(k, v)
 
         q = q.contiguous()
         k = k.contiguous()
@@ -244,11 +254,17 @@ class DecoderLayer(nn.Module):
         intermediate_size: int,
         layernorm_eps: float,
         model_tensors: safe_open,
+        cache: Optional["Cache"] = None,
     ):
         super().__init__()
 
         self._layer_idx = layer_idx
         self._hidden_size = hidden_size
+
+        if cache is not None:
+            self._cache = cache[layer_idx]
+        else:
+            self._cache = None
 
         self._self_attn = SelfAttention(
             layer_idx,
@@ -258,6 +274,7 @@ class DecoderLayer(nn.Module):
             num_kv_heads,
             layernorm_eps,
             model_tensors,
+            cache=self._cache,
         )
         self._mlp = MLP(layer_idx, hidden_size, intermediate_size, model_tensors)
         self._input_layernorm = LayerNorm(

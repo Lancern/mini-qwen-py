@@ -8,6 +8,7 @@ import torch.nn as nn
 from safetensors import safe_open
 from transformers import Qwen2Tokenizer
 
+from .cache import Cache
 from .transformer import DecoderLayer, LayerNorm
 
 if TYPE_CHECKING:
@@ -77,7 +78,7 @@ class RoPE(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, model_dir: "PathLike"):
+    def __init__(self, model_dir: "PathLike", use_cache: bool = True):
         super().__init__()
 
         with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
@@ -109,6 +110,12 @@ class Model(nn.Module):
             os.path.join(model_dir, "model.safetensors"), framework="pt"
         )
 
+        self._use_cache = use_cache
+        if use_cache:
+            self._cache = Cache(self._num_hidden_layers)
+        else:
+            self._cache = None
+
         self._embedding = Embedding(
             self._vocab_size, self._hidden_size, self._model_tensors
         )
@@ -123,6 +130,7 @@ class Model(nn.Module):
                 self._intermediate_size,
                 self._rms_norm_eps,
                 self._model_tensors,
+                cache=self._cache,
             )
             for idx in range(self._num_hidden_layers)
         ]
@@ -152,9 +160,10 @@ class Model(nn.Module):
             output_token = self._tokenizer.decode(output_id, skip_special_tokens=True)
             yield output_token
 
-            input_ids = torch.cat(
-                (input_ids.squeeze(0), torch.tensor([output_id]))
-            ).unsqueeze(0)
+            if self._use_cache:
+                input_ids = torch.tensor([[output_id]])
+            else:
+                input_ids = torch.cat((input_ids, torch.tensor([[output_id]])), dim=1)
 
     def generate_once(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids :: (batch_size, seq_len)
@@ -175,18 +184,18 @@ class Model(nn.Module):
         # input_ids :: (batch_size, seq_len)
         # ret :: (batch_size, seq_len, vocab_size)
 
-        batch_size = input_ids.shape[0]
-        seq_len = input_ids.shape[1]
-
         hidden_state = self._embedding(input_ids)
         # input_embedded :: (batch_size, seq_len, hidden_size)
-        assert hidden_state.shape == (
-            batch_size,
-            seq_len,
-            self._config["hidden_size"],
-        )
 
-        position_ids = torch.arange(0, seq_len, device=hidden_state.device).unsqueeze(0)
+        if self._use_cache:
+            generated_seq_len = self._cache[0].cached_seq_len
+        else:
+            generated_seq_len = 0
+
+        seq_len = input_ids.shape[1]
+        position_ids = torch.arange(
+            generated_seq_len, generated_seq_len + seq_len, device=hidden_state.device
+        ).unsqueeze(0)
         # position_ids :: (1, seq_len)
         position_embeddings = self._rope(hidden_state, position_ids)
         # position_embeddings :: tuple
