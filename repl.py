@@ -1,11 +1,12 @@
 from time import time
+import os
 
 import torch
 
 from miniqwen.model import Model
 
 
-device = torch.device("cpu")
+device = torch.device(os.getenv("MINIQWEN_DEVICE", "cpu"))
 m = Model("/mnt/d/LLM/Qwen3-0.6B").to(device)
 
 while True:

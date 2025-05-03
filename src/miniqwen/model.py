@@ -16,15 +16,19 @@ if TYPE_CHECKING:
     from os import PathLike
 
 
-class RoPE:
+class RoPE(nn.Module):
     def __init__(self, theta: int | float, head_dim: int):
+        super().__init__()
         assert head_dim % 2 == 0
 
         self._theta = theta
 
         # inv_freq :: (head_dim / 2)
         # inv_freq[i] = theta ** (-2i / head_dim)
-        self._inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2) / head_dim))
+        self.inv_freq = nn.Buffer(
+            1.0 / (theta ** (torch.arange(0, head_dim, 2) / head_dim)),
+            persistent=False,
+        )
 
     def __call__(
         self, x: torch.Tensor, position_ids: torch.Tensor
@@ -38,7 +42,7 @@ class RoPE:
         batch_size = x.shape[0]
 
         inv_freq_expanded = (
-            self._inv_freq[None, :, None].float().expand(batch_size, -1, 1)
+            self.inv_freq[None, :, None].float().expand(batch_size, -1, 1)
         )
         # inv_freq_expanded :: (batch_size, head_dim / 2, 1)
 
@@ -132,9 +136,11 @@ class Model(nn.Module):
             self.load_state_dict(states)
 
     def generate(self, prompt: str, max_generate_len: int = 1000) -> "Generator[str]":
+        device = self.embed_tokens.weight.device
+
         input_ids = self._tokenizer(
             self._apply_chat_template(prompt), return_tensors="pt"
-        )["input_ids"]
+        )["input_ids"].to(device)
         # input_ids :: (1, seq_len)
 
         for _ in range(max_generate_len):
@@ -146,9 +152,11 @@ class Model(nn.Module):
             yield output_token
 
             if self._use_cache:
-                input_ids = torch.tensor([[output_id]])
+                input_ids = torch.tensor([[output_id]], device=device)
             else:
-                input_ids = torch.cat((input_ids, torch.tensor([[output_id]])), dim=1)
+                input_ids = torch.cat(
+                    (input_ids, torch.tensor([[output_id]], device=device)), dim=1
+                )
 
     def generate_once(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids :: (batch_size, seq_len)
