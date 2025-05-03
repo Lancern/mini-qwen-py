@@ -1,6 +1,5 @@
 from typing import Optional, TYPE_CHECKING
 
-from safetensors import safe_open
 import torch
 import torch.nn as nn
 
@@ -11,13 +10,11 @@ if TYPE_CHECKING:
 class SelfAttention(nn.Module):
     def __init__(
         self,
-        layer_idx: int,
         hidden_size: int,
         head_dim: int,
         num_attention_heads: int,
         num_kv_heads: int,
         layernorm_eps: float,
-        model_tensors: safe_open,
         cache: Optional["LayerCache"] = None,
     ):
         super().__init__()
@@ -29,55 +26,17 @@ class SelfAttention(nn.Module):
 
         self._cache = cache
 
-        self._q_proj = nn.Linear(
-            hidden_size, num_attention_heads * head_dim, bias=False
-        )
-        self._k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
-        self._v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
-        self._o_proj = nn.Linear(
-            num_attention_heads * head_dim, hidden_size, bias=False
-        )
-        self._q_norm = LayerNorm(
-            f"model.layers.{layer_idx}.self_attn.q_norm.weight",
+        self.q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(num_attention_heads * head_dim, hidden_size, bias=False)
+        self.q_norm = LayerNorm(
             head_dim,
             layernorm_eps,
-            model_tensors,
         )
-        self._k_norm = LayerNorm(
-            f"model.layers.{layer_idx}.self_attn.k_norm.weight",
+        self.k_norm = LayerNorm(
             head_dim,
             layernorm_eps,
-            model_tensors,
-        )
-
-        # Load linear weights from model_tensors
-        self._q_proj.load_state_dict(
-            {
-                "weight": model_tensors.get_tensor(
-                    f"model.layers.{layer_idx}.self_attn.q_proj.weight"
-                )
-            }
-        )
-        self._k_proj.load_state_dict(
-            {
-                "weight": model_tensors.get_tensor(
-                    f"model.layers.{layer_idx}.self_attn.k_proj.weight"
-                )
-            }
-        )
-        self._v_proj.load_state_dict(
-            {
-                "weight": model_tensors.get_tensor(
-                    f"model.layers.{layer_idx}.self_attn.v_proj.weight"
-                )
-            }
-        )
-        self._o_proj.load_state_dict(
-            {
-                "weight": model_tensors.get_tensor(
-                    f"model.layers.{layer_idx}.self_attn.o_proj.weight"
-                )
-            }
         )
 
     def forward(
@@ -89,11 +48,11 @@ class SelfAttention(nn.Module):
         hidden_shape = (*input_shape, -1, self._head_dim)
         # hidden_shape = (batch_size, seq_len, -1, self._head_dim)
 
-        q_states = self._q_norm(self._q_proj(x).view(hidden_shape)).transpose(1, 2)
+        q_states = self.q_norm(self.q_proj(x).view(hidden_shape)).transpose(1, 2)
         # q_states :: (batch_size, num_attention_heads, seq_len, head_dim)
-        k_states = self._k_norm(self._k_proj(x).view(hidden_shape)).transpose(1, 2)
+        k_states = self.k_norm(self.k_proj(x).view(hidden_shape)).transpose(1, 2)
         # k_states :: (batch_size, num_kv_heads, seq_len, head_dim)
-        v_states = self._v_proj(x).view(hidden_shape).transpose(1, 2)
+        v_states = self.v_proj(x).view(hidden_shape).transpose(1, 2)
         # v_states :: (batch_size, num_kv_heads, seq_len, head_dim)
 
         cos, sin = position_embeddings
@@ -104,7 +63,7 @@ class SelfAttention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         # attn_output :: (batch_size, seq_len, num_attention_heads * head_dim)
-        attn_output = self._o_proj(attn_output)
+        attn_output = self.o_proj(attn_output)
         # attn_output :: (batch_size, seq_len, hidden_size)
 
         return attn_output
@@ -177,61 +136,30 @@ class SelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(
         self,
-        layer_idx: int,
         hidden_size: int,
         intermediate_size: int,
-        model_tensors: safe_open,
     ):
         super().__init__()
 
-        self._gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self._up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self._down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self._act_fn = nn.SiLU()
-
-        # Load weights from model_tensors
-        self._gate_proj.load_state_dict(
-            {
-                "weight": model_tensors.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.gate_proj.weight"
-                )
-            }
-        )
-        self._up_proj.load_state_dict(
-            {
-                "weight": model_tensors.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.up_proj.weight"
-                )
-            }
-        )
-        self._down_proj.load_state_dict(
-            {
-                "weight": model_tensors.get_tensor(
-                    f"model.layers.{layer_idx}.mlp.down_proj.weight"
-                )
-            }
-        )
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor):
         # x :: (batch_size, seq_len, hidden_size)
         # ret :: (batch_size, seq_len, hidden_size)
-        return self._down_proj(self._act_fn(self._gate_proj(x)) * self._up_proj(x))
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class LayerNorm(nn.Module):
-    def __init__(
-        self,
-        name: str,
-        hidden_size: int,
-        eps: float,
-        model_tensors: safe_open,
-    ):
+    def __init__(self, hidden_size: int, eps: float):
         super().__init__()
 
         self._hidden_size = hidden_size
         self._eps = eps
 
-        self._weight = model_tensors.get_tensor(name)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x: torch.Tensor):
         # x :: (batch_size, seq_len, hidden_size)
@@ -240,7 +168,7 @@ class LayerNorm(nn.Module):
         x = x.float()
         var = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self._eps)
-        return self._weight * x.to(input_dtype)
+        return self.weight * x.to(input_dtype)
 
 
 class DecoderLayer(nn.Module):
@@ -253,7 +181,6 @@ class DecoderLayer(nn.Module):
         num_kv_heads: int,
         intermediate_size: int,
         layernorm_eps: float,
-        model_tensors: safe_open,
         cache: Optional["Cache"] = None,
     ):
         super().__init__()
@@ -266,28 +193,22 @@ class DecoderLayer(nn.Module):
         else:
             self._cache = None
 
-        self._self_attn = SelfAttention(
-            layer_idx,
+        self.self_attn = SelfAttention(
             hidden_size,
             head_dim,
             num_attention_heads,
             num_kv_heads,
             layernorm_eps,
-            model_tensors,
             cache=self._cache,
         )
-        self._mlp = MLP(layer_idx, hidden_size, intermediate_size, model_tensors)
-        self._input_layernorm = LayerNorm(
-            f"model.layers.{layer_idx}.input_layernorm.weight",
+        self.mlp = MLP(hidden_size, intermediate_size)
+        self.input_layernorm = LayerNorm(
             hidden_size,
             layernorm_eps,
-            model_tensors,
         )
-        self._post_att_layernorm = LayerNorm(
-            f"model.layers.{layer_idx}.post_attention_layernorm.weight",
+        self.post_attention_layernorm = LayerNorm(
             hidden_size,
             layernorm_eps,
-            model_tensors,
         )
 
     def forward(
@@ -297,15 +218,15 @@ class DecoderLayer(nn.Module):
         # ret :: (batch_size, seq_len, hidden_size)
         residual = x
 
-        x = self._input_layernorm(x)
+        x = self.input_layernorm(x)
         # x :: (batch_size, seq_len, hidden_size)
 
-        x = self._self_attn(x, position_embeddings)
+        x = self.self_attn(x, position_embeddings)
         x = x + residual
         # x :: (batch_size, seq_len, hidden_size)
 
         residual = x
-        x = self._mlp(self._post_att_layernorm(x))
+        x = self.mlp(self.post_attention_layernorm(x))
         x = x + residual
         # x :: (batch_size, seq_len, hidden_size)
 

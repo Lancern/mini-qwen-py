@@ -16,25 +16,9 @@ if TYPE_CHECKING:
     from os import PathLike
 
 
-class Embedding(nn.Module):
-    def __init__(self, vocab_size: int, hidden_size: int, model_tensors: safe_open):
-        super().__init__()
-
-        self._embed = nn.Embedding(vocab_size, hidden_size)
-        self._embed.load_state_dict(
-            {"weight": model_tensors.get_tensor("model.embed_tokens.weight")}
-        )
-
-    def forward(self, x):
-        # x :: (batch_size, seq_len)
-        # ret :: (batch_size, seq_len, hidden_size)
-        return self._embed(x)
-
-
-class RoPE(nn.Module):
+class RoPE:
     def __init__(self, theta: int | float, head_dim: int):
         assert head_dim % 2 == 0
-        super().__init__()
 
         self._theta = theta
 
@@ -42,7 +26,7 @@ class RoPE(nn.Module):
         # inv_freq[i] = theta ** (-2i / head_dim)
         self._inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2) / head_dim))
 
-    def forward(
+    def __call__(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # x :: (batch_size, seq_len, head_dim)
@@ -78,7 +62,9 @@ class RoPE(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, model_dir: "PathLike", use_cache: bool = True):
+    def __init__(
+        self, model_dir: "PathLike", use_cache: bool = True, load_weights: bool = True
+    ):
         super().__init__()
 
         with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
@@ -106,9 +92,7 @@ class Model(nn.Module):
         self._eos: int = self._config["eos_token_id"]
 
         self._tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
-        self._model_tensors = safe_open(
-            os.path.join(model_dir, "model.safetensors"), framework="pt"
-        )
+        self._rope = RoPE(self._rope_theta, self._head_dim)
 
         self._use_cache = use_cache
         if use_cache:
@@ -116,35 +100,36 @@ class Model(nn.Module):
         else:
             self._cache = None
 
-        self._embedding = Embedding(
-            self._vocab_size, self._hidden_size, self._model_tensors
+        self.embed_tokens = nn.Embedding(self._vocab_size, self._hidden_size)
+        self.layers = nn.ModuleList(
+            [
+                DecoderLayer(
+                    idx,
+                    self._hidden_size,
+                    self._head_dim,
+                    self._num_attention_heads,
+                    self._num_key_value_heads,
+                    self._intermediate_size,
+                    self._rms_norm_eps,
+                    cache=self._cache,
+                )
+                for idx in range(self._num_hidden_layers)
+            ]
         )
-        self._rope = RoPE(self._rope_theta, self._head_dim)
-        self._decoder_layers = [
-            DecoderLayer(
-                idx,
-                self._hidden_size,
-                self._head_dim,
-                self._num_attention_heads,
-                self._num_key_value_heads,
-                self._intermediate_size,
-                self._rms_norm_eps,
-                self._model_tensors,
-                cache=self._cache,
-            )
-            for idx in range(self._num_hidden_layers)
-        ]
-        self._norm = LayerNorm(
-            "model.norm.weight",
-            self._hidden_size,
-            self._rms_norm_eps,
-            self._model_tensors,
-        )
+        self.norm = LayerNorm(self._hidden_size, self._rms_norm_eps)
+        self.lm_head = nn.Linear(self._hidden_size, self._vocab_size, bias=False)
 
-        self._lm_head = nn.Linear(self._hidden_size, self._vocab_size, bias=False)
-        self._lm_head.load_state_dict(
-            {"weight": self._model_tensors.get_tensor("lm_head.weight")}
-        )
+        if load_weights:
+            st_file = os.path.join(model_dir, "model.safetensors")
+
+            def remove_model_prefix(k: str) -> str:
+                if k.startswith("model."):
+                    return k[6:]
+                return k
+
+            with safe_open(st_file, framework="pt") as f:
+                states = {remove_model_prefix(k): f.get_tensor(k) for k in f.keys()}
+            self.load_state_dict(states)
 
     def generate(self, prompt: str, max_generate_len: int = 1000) -> "Generator[str]":
         input_ids = self._tokenizer(
@@ -184,7 +169,7 @@ class Model(nn.Module):
         # input_ids :: (batch_size, seq_len)
         # ret :: (batch_size, seq_len, vocab_size)
 
-        hidden_state = self._embedding(input_ids)
+        hidden_state = self.embed_tokens(input_ids)
         # input_embedded :: (batch_size, seq_len, hidden_size)
 
         if self._use_cache:
@@ -202,13 +187,13 @@ class Model(nn.Module):
         #   => position_embeddings[0] :: (batch_size, seq_len, hidden_size)
         #   => position_embeddings[1] :: (batch_size, seq_len, hidden_size)
 
-        for decoder_layer in self._decoder_layers:
+        for decoder_layer in self.layers:
             hidden_state = decoder_layer(hidden_state, position_embeddings)
 
-        hidden_state = self._norm(hidden_state)
+        hidden_state = self.norm(hidden_state)
         # hidden_state :: (batch_size, seq_len, hidden_size)
 
-        return self._lm_head(hidden_state)
+        return self.lm_head(hidden_state)
 
     def _apply_chat_template(self, prompt: str) -> str:
         return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
