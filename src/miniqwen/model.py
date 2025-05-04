@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 from safetensors import safe_open
-from transformers import Qwen2Tokenizer
 
 from .cache import Cache
+from .tokenizer import Tokenizer
 from .transformer import DecoderLayer, LayerNorm
 
 if TYPE_CHECKING:
@@ -95,7 +95,7 @@ class Model(nn.Module):
 
         self._eos: int = self._config["eos_token_id"]
 
-        self._tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
+        self._tokenizer = Tokenizer(model_dir)
         self._rope = RoPE(self._rope_theta, self._head_dim)
 
         self._use_cache = use_cache
@@ -138,9 +138,7 @@ class Model(nn.Module):
     def generate(self, prompt: str, max_generate_len: int = 1000) -> "Generator[str]":
         device = self.embed_tokens.weight.device
 
-        input_ids = self._tokenizer(
-            self._apply_chat_template(prompt), return_tensors="pt"
-        )["input_ids"].to(device)
+        input_ids = self._tokenizer.tokenize_for_chat(prompt).to(device)
         # input_ids :: (1, seq_len)
 
         for _ in range(max_generate_len):
@@ -148,7 +146,7 @@ class Model(nn.Module):
             if output_id == self._eos:
                 break
 
-            output_token = self._tokenizer.decode(output_id, skip_special_tokens=True)
+            output_token = self._tokenizer.decode(output_id)
             yield output_token
 
             if self._use_cache:
@@ -202,9 +200,6 @@ class Model(nn.Module):
         # hidden_state :: (batch_size, seq_len, hidden_size)
 
         return self.lm_head(hidden_state)
-
-    def _apply_chat_template(self, prompt: str) -> str:
-        return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
     def _apply_top_k(self, logits: torch.Tensor) -> torch.Tensor:
         # logits :: (batch_size, vocab_size)

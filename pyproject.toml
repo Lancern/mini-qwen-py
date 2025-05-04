@@ -8,9 +8,9 @@ authors = [
 license-files = ["LICENSE"]
 
 dependencies = [
+    "regex",
     "safetensors",
     "torch",
-    "transformers",
 ]
 
 [build-system]
