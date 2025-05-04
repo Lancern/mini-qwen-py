@@ -67,83 +67,154 @@ class RoPE(nn.Module):
 
 class Model(nn.Module):
     def __init__(
-        self, model_dir: "PathLike", use_cache: bool = True, load_weights: bool = True
+        self,
+        vocab_size: int,
+        rope_theta: float,
+        hidden_size: int,
+        num_hidden_layers: int,
+        head_dim: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        intermediate_size: int,
+        rms_norm_eps: float,
+        use_cache: bool = True,
     ):
         super().__init__()
 
-        with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
-            self._config = json.load(f)
-        with open(
-            os.path.join(model_dir, "generation_config.json"), "r", encoding="utf-8"
-        ) as f:
-            self._generation_config = json.load(f)
-
-        self._vocab_size: int = self._config["vocab_size"]
-        self._rope_theta: float = self._config["rope_theta"]
-
-        self._hidden_size: int = self._config["hidden_size"]
-        self._head_dim: int = self._config["head_dim"]
-        self._num_attention_heads: int = self._config["num_attention_heads"]
-        self._num_key_value_heads: int = self._config["num_key_value_heads"]
-        self._intermediate_size: int = self._config["intermediate_size"]
-        self._rms_norm_eps: float = self._config["rms_norm_eps"]
-        self._num_hidden_layers: int = self._config["num_hidden_layers"]
-
-        self._temperature: float = self._generation_config["temperature"]
-        self._top_k: float = self._generation_config["top_k"]
-        self._top_p: float = self._generation_config["top_p"]
-
-        self._eos: int = self._config["eos_token_id"]
-
-        self._tokenizer = Tokenizer(model_dir)
-        self._rope = RoPE(self._rope_theta, self._head_dim)
-
         self._use_cache = use_cache
         if use_cache:
-            self._cache = Cache(self._num_hidden_layers)
+            self._cache = Cache(num_hidden_layers)
         else:
             self._cache = None
 
-        self.embed_tokens = nn.Embedding(self._vocab_size, self._hidden_size)
+        self._rope = RoPE(rope_theta, head_dim)
+
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.layers = nn.ModuleList(
             [
                 DecoderLayer(
                     idx,
-                    self._hidden_size,
-                    self._head_dim,
-                    self._num_attention_heads,
-                    self._num_key_value_heads,
-                    self._intermediate_size,
-                    self._rms_norm_eps,
+                    hidden_size,
+                    head_dim,
+                    num_attention_heads,
+                    num_key_value_heads,
+                    intermediate_size,
+                    rms_norm_eps,
                     cache=self._cache,
                 )
-                for idx in range(self._num_hidden_layers)
+                for idx in range(num_hidden_layers)
             ]
         )
-        self.norm = LayerNorm(self._hidden_size, self._rms_norm_eps)
-        self.lm_head = nn.Linear(self._hidden_size, self._vocab_size, bias=False)
+        self.norm = LayerNorm(hidden_size, rms_norm_eps)
 
-        if load_weights:
-            st_file = os.path.join(model_dir, "model.safetensors")
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # input_ids :: (batch_size, seq_len)
+        # ret :: (batch_size, seq_len, vocab_size)
 
-            def remove_model_prefix(k: str) -> str:
-                if k.startswith("model."):
-                    return k[6:]
-                return k
+        hidden_state = self.embed_tokens(input_ids)
+        # hidden_state :: (batch_size, seq_len, hidden_size)
 
-            with safe_open(st_file, framework="pt") as f:
-                states = {remove_model_prefix(k): f.get_tensor(k) for k in f.keys()}
-            self.load_state_dict(states)
+        if self._use_cache:
+            generated_seq_len = self._cache[0].cached_seq_len
+        else:
+            generated_seq_len = 0
+
+        seq_len = input_ids.shape[1]
+        position_ids = torch.arange(
+            generated_seq_len, generated_seq_len + seq_len, device=hidden_state.device
+        ).unsqueeze(0)
+        # position_ids :: (1, seq_len)
+        position_embeddings = self._rope(hidden_state, position_ids)
+        # position_embeddings :: tuple
+        #   => position_embeddings[0] :: (batch_size, seq_len, hidden_size)
+        #   => position_embeddings[1] :: (batch_size, seq_len, hidden_size)
+
+        for decoder_layer in self.layers:
+            hidden_state = decoder_layer(hidden_state, position_embeddings)
+            # hidden_state :: (batch_size, seq_len, hidden_size)
+
+        return self.norm(hidden_state)
+
+
+class MiniQwen(nn.Module):
+    @staticmethod
+    def from_pretrained(model_dir: "PathLike") -> "MiniQwen":
+        with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
+            config = json.load(f)
+        with open(os.path.join(model_dir, "generation_config.json"), "r", encoding="utf-8") as f:
+            generation_config = json.load(f)
+
+        tokenizer = Tokenizer(model_dir)
+        module = MiniQwen(
+            tokenizer=tokenizer,
+            vocab_size=config["vocab_size"],
+            rope_theta=config["rope_theta"],
+            hidden_size=config["hidden_size"],
+            num_hidden_layers=config["num_hidden_layers"],
+            head_dim=config["head_dim"],
+            num_attention_heads=config["num_attention_heads"],
+            num_key_value_heads=config["num_key_value_heads"],
+            intermediate_size=config["intermediate_size"],
+            rms_norm_eps=config["rms_norm_eps"],
+            temperature=generation_config["temperature"],
+            top_k=generation_config["top_k"],
+            top_p=generation_config["top_p"],
+        )
+
+        with safe_open(os.path.join(model_dir, "model.safetensors"), framework="pt") as f:
+            sdict = {key: f.get_tensor(key) for key in f.keys()}
+            module.load_state_dict(sdict)
+
+        return module
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        vocab_size: int,
+        rope_theta: float,
+        hidden_size: int,
+        num_hidden_layers: int,
+        head_dim: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        intermediate_size: int,
+        rms_norm_eps: float,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        use_cache: bool = True,
+    ):
+        super().__init__()
+
+        self._tokenizer = tokenizer
+        self._temperature = temperature
+        self._top_k = top_k
+        self._top_p = top_p
+        self._use_cache = use_cache
+
+        self.model = Model(
+            vocab_size,
+            rope_theta,
+            hidden_size,
+            num_hidden_layers,
+            head_dim,
+            num_attention_heads,
+            num_key_value_heads,
+            intermediate_size,
+            rms_norm_eps,
+            use_cache,
+        )
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def generate(self, prompt: str, max_generate_len: int = 1000) -> "Generator[str]":
-        device = self.embed_tokens.weight.device
+        device = self.lm_head.weight.device
 
         input_ids = self._tokenizer.tokenize_for_chat(prompt).to(device)
         # input_ids :: (1, seq_len)
 
         for _ in range(max_generate_len):
             output_id = int(self.generate_once(input_ids).squeeze())
-            if output_id == self._eos:
+            if output_id == self._tokenizer.eos:
                 break
 
             output_token = self._tokenizer.decode(output_id)
@@ -171,35 +242,9 @@ class Model(nn.Module):
 
         return torch.multinomial(probs, num_samples=1)
 
-    def forward(self, input_ids: torch.Tensor):
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids :: (batch_size, seq_len)
-        # ret :: (batch_size, seq_len, vocab_size)
-
-        hidden_state = self.embed_tokens(input_ids)
-        # input_embedded :: (batch_size, seq_len, hidden_size)
-
-        if self._use_cache:
-            generated_seq_len = self._cache[0].cached_seq_len
-        else:
-            generated_seq_len = 0
-
-        seq_len = input_ids.shape[1]
-        position_ids = torch.arange(
-            generated_seq_len, generated_seq_len + seq_len, device=hidden_state.device
-        ).unsqueeze(0)
-        # position_ids :: (1, seq_len)
-        position_embeddings = self._rope(hidden_state, position_ids)
-        # position_embeddings :: tuple
-        #   => position_embeddings[0] :: (batch_size, seq_len, hidden_size)
-        #   => position_embeddings[1] :: (batch_size, seq_len, hidden_size)
-
-        for decoder_layer in self.layers:
-            hidden_state = decoder_layer(hidden_state, position_embeddings)
-
-        hidden_state = self.norm(hidden_state)
-        # hidden_state :: (batch_size, seq_len, hidden_size)
-
-        return self.lm_head(hidden_state)
+        return self.lm_head(self.model(input_ids))
 
     def _apply_top_k(self, logits: torch.Tensor) -> torch.Tensor:
         # logits :: (batch_size, vocab_size)

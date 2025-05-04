@@ -3,11 +3,11 @@ import os
 
 import torch
 
-from miniqwen.model import Model
+from miniqwen.model import MiniQwen
 
 
 device = torch.device(os.getenv("MINIQWEN_DEVICE", "cpu"))
-m = Model("/mnt/d/LLM/Qwen3-0.6B").to(device)
+m = MiniQwen.from_pretrained("/mnt/d/LLM/Qwen3-0.6B").to(device)
 
 while True:
     prompt = input("> ").strip()
