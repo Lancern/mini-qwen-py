@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 from time import time
 import os
 
@@ -6,8 +7,15 @@ import torch
 from miniqwen.model import MiniQwen
 
 
-device = torch.device(os.getenv("MINIQWEN_DEVICE", "cpu"))
-m = MiniQwen.from_pretrained("/mnt/d/LLM/Qwen3-0.6B").to(device)
+parser = ArgumentParser(description="MiniQwen REPL")
+parser.add_argument("-d", "--device", default="cpu", help="Device to use")
+parser.add_argument("model_dir", help="Path to the model directory")
+
+args = parser.parse_args()
+model_dir = args.model_dir or os.getcwd()
+device = torch.device(args.device)
+
+m = MiniQwen.from_pretrained(model_dir).to(device)
 
 while True:
     prompt = input("> ").strip()

@@ -8,6 +8,7 @@ authors = [
 license-files = ["LICENSE"]
 
 dependencies = [
+    "numpy",
     "regex",
     "safetensors",
     "torch",
